@@ -1,13 +1,14 @@
 package main
 
-import "core:slice"
 import "core:sys/linux"
 
-is_space :: proc(c: u8) -> bool {
+is_space :: #force_inline proc(c: u8) -> bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
 }
 
+
 buffer := []u8{}
+line_buffer := []u8{}
 env_buffer := []u8{}
 env_len := 0
 exit_code := 0
@@ -19,6 +20,30 @@ foreign _ {
 	write :: proc(fd: i32, s: string) ---
 	@(link_name = "asm_read")
 	read :: proc(fd: i32, buffer_ptr: [^]u8, buffer_len: int) -> int ---
+	@(link_name = "asm_to_cstring")
+	_to_cstring :: proc(dest: [^]u8, src: rawptr, len: int) -> cstring ---
+	@(link_name = "asm_join")
+	_join :: proc(dest: [^]u8, strings_ptr: [^]string, count: int, sep_ptr: [^]u8, sep_len: int) -> int ---
+}
+
+to_cstring :: proc(s: string, allocator := context.temp_allocator) -> cstring {
+	if len(s) == 0 do return ""
+	mem := make([]u8, len(s) + 1, allocator)
+	return _to_cstring(raw_data(mem), raw_data(s), len(s))
+}
+
+join :: proc(a: []string, sep: string, allocator := context.temp_allocator) -> string {
+	if len(a) == 0 do return ""
+	if len(a) == 1 do return a[0]
+
+	total_len := len(sep) * (len(a) - 1)
+	for s in a do total_len += len(s)
+
+	mem := make([]u8, total_len, allocator)
+
+	_join(raw_data(mem), raw_data(a), len(a), raw_data(sep), len(sep))
+
+	return string(mem)
 }
 
 slice_alloc :: proc(size: int) -> []u8 {
@@ -53,7 +78,7 @@ Raw_Slice :: struct {
 
 init_env :: proc() {
 	path := "/proc/self/environ"
-	path_cstr := to_cstring(path, context.temp_allocator)
+	path_cstr := to_cstring(path)
 
 	fd, errno := linux.open(path_cstr, {.RDWR}, {})
 	if errno != .NONE {return}
@@ -126,33 +151,29 @@ set_env :: proc(key, val: string) {
 
 find_path :: proc(cmd: string, allocator := context.temp_allocator) -> cstring {
 	if contains(cmd, "/") {
-		return to_cstring(cmd, allocator)
+		return to_cstring(cmd)
 	}
 
 	path_env := get_env("PATH")
-	if path_env == "" {
-		path_env = "/usr/bin:/bin"
-	}
+	if path_env == "" do path_env = "/usr/bin:/bin"
 
 	directories := split(path_env, ':', allocator)
-
 	for dir in directories {
 		if len(dir) == 0 do continue
-
 		full_path := join({dir, "/", cmd}, "", allocator)
-		c_path := to_cstring(full_path, allocator)
 
+		c_path := to_cstring(full_path)
 		stat: linux.Stat
 		if linux.stat(c_path, &stat) == .NONE {
 			return c_path
 		}
 	}
-	return to_cstring(cmd, allocator)
+	return to_cstring(cmd)
 }
 
 execve :: proc(prog: string, argv: []cstring) {
 	if contains(prog, "/") {
-		p_cstr := to_cstring(prog, context.temp_allocator)
+		p_cstr := to_cstring(prog)
 		linux.execve(p_cstr, raw_data(argv), nil)
 		return
 	}
@@ -162,7 +183,7 @@ execve :: proc(prog: string, argv: []cstring) {
 
 	for p in paths {
 		full_path := join({p, "/", prog}, "", context.temp_allocator)
-		c_path := to_cstring(full_path, context.temp_allocator)
+		c_path := to_cstring(full_path)
 
 		linux.execve(c_path, raw_data(argv), nil)
 	}
@@ -249,14 +270,6 @@ split :: proc(s: string, char: byte, allocator := context.temp_allocator) -> []s
 	}
 	res[curr_n] = s[start:]
 	return res
-}
-
-to_cstring :: proc(s: string, allocator := context.temp_allocator) -> cstring {
-	if len(s) == 0 do return ""
-	b := make([]byte, len(s) + 1, allocator)
-	copy(b, s)
-	b[len(s)] = 0
-	return cstring(&b[0])
 }
 
 trim_space :: proc(s: string) -> string {
@@ -355,22 +368,6 @@ concatenate :: proc(a: []string, allocator := context.temp_allocator) -> string 
 	return string(b)
 }
 
-join :: proc(a: []string, sep: string, allocator := context.temp_allocator) -> string {
-	if len(a) == 0 do return ""
-	if len(a) == 1 do return a[0]
-
-	total_len := len(sep) * (len(a) - 1)
-	for s in a do total_len += len(s)
-
-	b := make([]byte, total_len, allocator)
-
-	offset := copy(b, a[0])
-	for s in a[1:] {
-		offset += copy(b[offset:], sep)
-		offset += copy(b[offset:], s)
-	}
-	return string(b)
-}
 
 has_prefix :: proc(s, prefix: string) -> (result: bool) {
 	return len(s) >= len(prefix) && s[0:len(prefix)] == prefix
@@ -393,7 +390,7 @@ get_cwd :: proc() -> string {
 }
 
 set_cwd :: proc(path: string) -> bool {
-	cpath := to_cstring(path, context.temp_allocator)
+	cpath := to_cstring(path)
 
 	errno := linux.chdir(cpath)
 	return errno == .NONE
@@ -445,99 +442,56 @@ expand_env :: proc(args: []string) -> []string {
 	return args
 }
 
-run_cmd :: proc(prog: string, args: []string) {
+run_cmd :: proc(prog: string, args: []string, is_forked := false) {
 	argv: [128]cstring
+	argv[0] = find_path(prog)
 
-	in_fd: linux.Fd = 0
-	out_fd: linux.Fd = 1
-	err_fd: linux.Fd = 2
+	arg_count := 1
+	out_file: string
+	append_mode := false
 
-	h_string: string
-	has_h := false
-
-	argv[0] = to_cstring(prog, context.temp_allocator)
-	arg_idx := 1
-
-	i := 0
-	for i < len(args) {
+	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
-
-		if arg == ">" || arg == "1>" || arg == ">>" || arg == "2>" || arg == "<" || arg == "<<<" {
-			if i + 1 >= len(args) do break
-			target := args[i + 1]
-			t_cstr := to_cstring(target, context.temp_allocator)
-
-			switch arg {
-			case ">", "1>":
-				out_fd, _ = linux.open(
-					t_cstr,
-					{.WRONLY, .CREAT, .TRUNC},
-					{.IRUSR, .IWUSR, .IRGRP, .IROTH},
-				)
-			case ">>":
-				out_fd, _ = linux.open(
-					t_cstr,
-					{.WRONLY, .CREAT, .APPEND},
-					{.IRUSR, .IWUSR, .IRGRP, .IROTH},
-				)
-			case "2>":
-				err_fd, _ = linux.open(
-					t_cstr,
-					{.WRONLY, .CREAT, .TRUNC},
-					{.IRUSR, .IWUSR, .IRGRP, .IROTH},
-				)
-			case "<":
-				in_fd, _ = linux.open(t_cstr, {.RDWR}, {})
-			case "<<<":
-				h_string = target
-				has_h = true
+		if arg == ">" || arg == ">>" {
+			if i + 1 < len(args) {
+				out_file = args[i + 1]
+				append_mode = (arg == ">>")
+				break
 			}
-			i += 2
-			continue
 		}
 
-		if arg_idx < 128 - 1 {
-			argv[arg_idx] = to_cstring(arg, context.temp_allocator)
-			arg_idx += 1
+		if arg_count < 127 {
+			argv[arg_count] = to_cstring(arg)
+			arg_count += 1
 		}
-		i += 1
 	}
+	argv[arg_count] = nil
 
-	argv[arg_idx] = nil
+	execute_internal :: proc(path: cstring, argv: [^]cstring, out_file: string, append: bool) {
+		if out_file != "" {
+			flags: linux.Open_Flags = {.WRONLY, .CREAT}
+			if append do flags += {.APPEND}
+			else do flags += {.TRUNC}
 
-	pid, errno := linux.fork()
-	if errno != .NONE {
-		write(2, "Fork failed\n")
-		return
-	}
-
-	if pid == 0 {
-		if in_fd != 0 {linux.dup2(in_fd, 0); linux.close(in_fd)}
-		if out_fd != 1 {linux.dup2(out_fd, 1); linux.close(out_fd)}
-		if err_fd != 2 {linux.dup2(err_fd, 2); linux.close(err_fd)}
-
-		if has_h {
-			fds: [2]linux.Fd
-			linux.pipe2(&fds, {.CLOEXEC})
-			linux.write(fds[1], transmute([]u8)h_string)
-			linux.close(fds[1])
-			linux.dup2(fds[0], 0)
-			linux.close(fds[0])
+			fd, errno := linux.open(to_cstring(out_file), flags, {.IRUSR, .IWUSR, .IRGRP, .IROTH})
+			if errno == .NONE {
+				linux.dup2(fd, 1)
+				linux.close(fd)
+			}
 		}
-
-		execve(prog, argv[:arg_idx])
+		linux.execve(path, argv, nil)
 		exit(127)
+	}
+
+	if is_forked {
+		execute_internal(argv[0], raw_data(argv[:]), out_file, append_mode)
 	} else {
-		if in_fd != 0 do linux.close(in_fd)
-		if out_fd != 1 do linux.close(out_fd)
-		if err_fd != 2 do linux.close(err_fd)
-
-		status: u32
-		linux.waitpid(pid, &status, {}, nil)
-
-		exit_code := (status >> 8) & 0xFF
-		exit_str := itoa(int(exit_code))
-		set_env("?", exit_str)
+		pid, _ := linux.fork()
+		if pid == 0 {
+			execute_internal(argv[0], raw_data(argv[:]), out_file, append_mode)
+		} else {
+			linux.waitpid(pid, nil, {}, nil)
+		}
 	}
 }
 
@@ -578,7 +532,7 @@ exec :: proc(input: string) {
 					exit(0)
 				}
 
-				run_cmd(args[0], args[1:])
+				run_cmd(args[0], args[1:], true)
 				exit(0)
 			} else {
 				if prev_read_end != 0 do linux.close(prev_read_end)
@@ -624,6 +578,7 @@ print_prompt :: proc(username, hostname, cwd: string) {
 
 main :: proc() {
 	buffer = slice_alloc(4096)
+	line_buffer = slice_alloc(4096)
 	env_buffer = slice_alloc(4096)
 
 	init_env()
@@ -634,7 +589,7 @@ main :: proc() {
 	for {
 		print_prompt(username, hostname, get_cwd())
 
-		line, ok := read_line(&buffer)
+		line, ok := read_line(&line_buffer)
 
 		if !ok {
 			exit(0)

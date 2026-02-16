@@ -7,4 +7,4 @@ A minimalist, high-performance Linux shell written in Odin with some assembly, d
 ```bash
 ./build.sh
 ```
-Done! You can optionaly strip the binary using strip or sstrip (from ELFkickers). After that, the size of binary is under 22K.
+Done! Now, the size of binary is under 20K ( around 18.9K on glibc-based system ). And the shell is usable for simple tasks too.
