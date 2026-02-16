@@ -1,18 +1,14 @@
 package main
 
+import "core:slice"
 import "core:sys/linux"
 
-_ascii_space := [256]bool {
-	'\t' = true,
-	'\n' = true,
-	'\v' = true,
-	'\f' = true,
-	'\r' = true,
-	' '  = true,
+is_space :: proc(c: u8) -> bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
 }
 
-buffer := [1024]u8{}
-env_buffer := [4096]u8{}
+buffer := []u8{}
+env_buffer := []u8{}
 env_len := 0
 exit_code := 0
 
@@ -23,6 +19,36 @@ foreign _ {
 	write :: proc(fd: i32, s: string) ---
 	@(link_name = "asm_read")
 	read :: proc(fd: i32, buffer_ptr: [^]u8, buffer_len: int) -> int ---
+}
+
+slice_alloc :: proc(size: int) -> []u8 {
+	addr, errno := linux.mmap(0, uint(size), {.READ, .WRITE}, {.PRIVATE, .ANONYMOUS}, -1, 0)
+	if errno != .NONE {
+		write(2, "mmap failed\n")
+		exit(1)
+	}
+
+	return transmute([]u8)Raw_Slice{data = addr, len = size}
+}
+
+slice_grow :: proc(old_slice: []u8, new_size: int) -> []u8 {
+	new_addr, errno := linux.mremap(
+		raw_data(old_slice),
+		uint(len(old_slice)),
+		uint(new_size),
+		{.MAYMOVE},
+	)
+	if errno != .NONE {
+		write(2, "mremap failed\n")
+		exit(1)
+	}
+
+	return transmute([]u8)Raw_Slice{data = new_addr, len = new_size}
+}
+
+Raw_Slice :: struct {
+	data: rawptr,
+	len:  int,
 }
 
 init_env :: proc() {
@@ -63,11 +89,9 @@ get_env :: proc(key: string) -> string {
 }
 
 set_env :: proc(key, val: string) {
-	// 1. Prepare the full "KEY=VAL" string
 	full_entry := join({key, "=", val}, "", context.temp_allocator)
 	entry_len := len(full_entry)
 
-	// 2. Try to find the existing key in env_buffer
 	cursor := 0
 	for cursor < env_len {
 		start := cursor
@@ -76,30 +100,20 @@ set_env :: proc(key, val: string) {
 
 		entry := string(env_buffer[start:end])
 
-		// Check if this is the key we are looking for
 		if len(entry) > len(key) && entry[len(key)] == '=' && entry[:len(key)] == key {
-			// Found it!
-			// If new value fits in the old slot, overwrite it.
-			// Otherwise, we'll just append a new one at the end (simplest for a raw buffer).
 			if entry_len <= len(entry) {
 				copy(env_buffer[start:], full_entry)
-				// If it's shorter, we need to ensure we don't leave old characters
-				// by shifting the null terminator or zeroing.
 				if entry_len < len(entry) {
 					for i in entry_len ..< len(entry) {env_buffer[start + i] = 0}
 				}
 				return
 			}
-			// If it doesn't fit, we "invalidate" the old entry by setting its first char to 0
-			// and fall through to the append logic.
 			env_buffer[start] = 0
 			break
 		}
 		cursor = end + 1
 	}
 
-	// 3. Append to the end of the buffer
-	// Ensure we have space for: the new entry + a null terminator
 	if env_len + entry_len + 1 <= len(env_buffer) {
 		copy(env_buffer[env_len:], full_entry)
 		env_len += entry_len
@@ -154,33 +168,64 @@ execve :: proc(prog: string, argv: []cstring) {
 	}
 }
 
-read_line :: proc(buf: []u8) -> (string, bool) {
-	for i in 0 ..< len(buf) do buf[i] = 0
-	n := read(0, raw_data(buf), len(buf))
-	s := string(buf[:n])
-	return trim_space(s), true
+read_line :: proc(buf: ^[]u8) -> (string, bool) {
+	total_read := 0
+
+	for {
+		if total_read >= len(buf^) {
+			new_size := len(buf^) + 4096
+			if new_size == 0 do new_size = 4096
+			buf^ = slice_grow(buf^, new_size)
+		}
+		b: u8
+		n := read(0, &b, 1)
+
+		if n <= 0 {
+			if total_read == 0 do return "", false
+			break
+		}
+
+		if b == '\n' {
+			break
+		}
+
+		buf^[total_read] = b
+		total_read += 1
+	}
+
+	return string(buf^[:total_read]), true
 }
 
-itoa :: proc(buf: []u8, n: int) -> string {
+itoa :: proc(n: int, allocator := context.temp_allocator) -> string {
 	if n == 0 do return "0"
+
+	buf: [21]byte
+	i := len(buf)
 
 	val := n
 	is_negative := false
+
 	if val < 0 {
 		is_negative = true
 		val = -val
 	}
-	i := len(buf)
+
 	for val > 0 {
 		i -= 1
-		buf[i] = u8(val % 10) + '0'
+		buf[i] = byte(val % 10) + '0'
 		val /= 10
 	}
+
 	if is_negative {
 		i -= 1
 		buf[i] = '-'
 	}
-	return string(buf[i:])
+
+	res_bytes := buf[i:]
+	s := make([]byte, len(res_bytes), allocator)
+	copy(s, res_bytes)
+
+	return string(s)
 }
 
 split :: proc(s: string, char: byte, allocator := context.temp_allocator) -> []string {
@@ -218,14 +263,14 @@ trim_space :: proc(s: string) -> string {
 	if len(s) == 0 do return ""
 
 	start := 0
-	if start < len(s) && _ascii_space[s[start]] {
+	if start < len(s) && is_space(s[start]) {
 		start += 1
 	}
 
 	if start == len(s) do return ""
 
 	end := len(s)
-	for end > start && _ascii_space[s[end - 1]] {
+	for end > start && is_space(s[end - 1]) {
 		end -= 1
 	}
 
@@ -259,7 +304,7 @@ fields :: proc(s: string, allocator := context.temp_allocator) -> []string {
 	n := 0
 	in_field := false
 	for i in 0 ..< len(s) {
-		is_space := _ascii_space[s[i]] == true
+		is_space := is_space(s[i]) == true
 		if !is_space && !in_field {
 			in_field = true
 			n += 1
@@ -275,7 +320,7 @@ fields :: proc(s: string, allocator := context.temp_allocator) -> []string {
 	field_start := -1
 
 	for i in 0 ..< len(s) {
-		is_space := _ascii_space[s[i]] == true
+		is_space := is_space(s[i]) == true
 		if !is_space {
 			if field_start == -1 do field_start = i
 		} else {
@@ -491,7 +536,7 @@ run_cmd :: proc(prog: string, args: []string) {
 		linux.waitpid(pid, &status, {}, nil)
 
 		exit_code := (status >> 8) & 0xFF
-		exit_str := itoa(buffer[:], int(exit_code))
+		exit_str := itoa(int(exit_code))
 		set_env("?", exit_str)
 	}
 }
@@ -578,13 +623,18 @@ print_prompt :: proc(username, hostname, cwd: string) {
 
 
 main :: proc() {
+	buffer = slice_alloc(4096)
+	env_buffer = slice_alloc(4096)
+
+	init_env()
+
 	username := get_env("USER")
 	hostname := get_env("HOSTNAME")
 
 	for {
 		print_prompt(username, hostname, get_cwd())
 
-		line, ok := read_line(buffer[:])
+		line, ok := read_line(&buffer)
 
 		if !ok {
 			exit(0)
