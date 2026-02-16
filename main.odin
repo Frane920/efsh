@@ -20,6 +20,12 @@ foreign _ {
 	write :: proc(fd: i32, s: string) ---
 	@(link_name = "asm_read")
 	read :: proc(fd: i32, buffer_ptr: [^]u8, buffer_len: int) -> int ---
+	@(link_name = "asm_close")
+	close :: proc(fd: linux.Fd) -> linux.Errno ---
+	@(link_name = "asm_mmap")
+	asm_mmap :: proc(addr: rawptr, size: uint, prot: i32, flags: i32, fd: i32, offset: i64) -> rawptr ---
+	@(link_name = "asm_mremap")
+	asm_mremap :: proc(old_addr: rawptr, old_size: uint, new_size: uint, flags: i32) -> rawptr ---
 	@(link_name = "asm_to_cstring")
 	_to_cstring :: proc(dest: [^]u8, src: rawptr, len: int) -> cstring ---
 	@(link_name = "asm_join")
@@ -47,8 +53,9 @@ join :: proc(a: []string, sep: string, allocator := context.temp_allocator) -> s
 }
 
 slice_alloc :: proc(size: int) -> []u8 {
-	addr, errno := linux.mmap(0, uint(size), {.READ, .WRITE}, {.PRIVATE, .ANONYMOUS}, -1, 0)
-	if errno != .NONE {
+	addr := asm_mmap(nil, uint(size), 0x1 | 0x2, 0x02 | 0x20, -1, 0)
+
+	if uintptr(addr) >= ~uintptr(4095) {
 		write(2, "mmap failed\n")
 		exit(1)
 	}
@@ -57,13 +64,9 @@ slice_alloc :: proc(size: int) -> []u8 {
 }
 
 slice_grow :: proc(old_slice: []u8, new_size: int) -> []u8 {
-	new_addr, errno := linux.mremap(
-		raw_data(old_slice),
-		uint(len(old_slice)),
-		uint(new_size),
-		{.MAYMOVE},
-	)
-	if errno != .NONE {
+	new_addr := asm_mremap(raw_data(old_slice), uint(len(old_slice)), uint(new_size), 1)
+
+	if uintptr(new_addr) >= ~uintptr(4095) {
 		write(2, "mremap failed\n")
 		exit(1)
 	}
@@ -85,7 +88,7 @@ init_env :: proc() {
 
 	n, _ := linux.read(fd, env_buffer[:])
 	env_len = n
-	linux.close(fd)
+	close(fd)
 }
 
 get_env :: proc(key: string) -> string {
@@ -476,7 +479,7 @@ run_cmd :: proc(prog: string, args: []string, is_forked := false) {
 			fd, errno := linux.open(to_cstring(out_file), flags, {.IRUSR, .IWUSR, .IRGRP, .IROTH})
 			if errno == .NONE {
 				linux.dup2(fd, 1)
-				linux.close(fd)
+				close(fd)
 			}
 		}
 		linux.execve(path, argv, nil)
@@ -519,13 +522,13 @@ exec :: proc(input: string) {
 			if pid == 0 {
 				if prev_read_end != 0 {
 					linux.dup2(prev_read_end, 0)
-					linux.close(prev_read_end)
+					close(prev_read_end)
 				}
 
 				if !is_last {
 					linux.dup2(next_pipe[1], 1)
-					linux.close(next_pipe[0])
-					linux.close(next_pipe[1])
+					close(next_pipe[0])
+					close(next_pipe[1])
 				}
 
 				if args[0] == "cd" || args[0] == "exit" {
@@ -535,9 +538,9 @@ exec :: proc(input: string) {
 				run_cmd(args[0], args[1:], true)
 				exit(0)
 			} else {
-				if prev_read_end != 0 do linux.close(prev_read_end)
+				if prev_read_end != 0 do close(prev_read_end)
 				if !is_last {
-					linux.close(next_pipe[1])
+					close(next_pipe[1])
 					prev_read_end = next_pipe[0]
 				}
 
