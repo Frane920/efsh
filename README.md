@@ -5,6 +5,6 @@ A minimalist, high-performance Linux shell written in Odin with some assembly, d
 
 ### Compilation
 ```bash
-./build.sh
+make build strip
 ```
-Done! Now, the size of binary is under 20K ( around 18.9K on glibc-based system ). And the shell is usable for simple tasks too.
+Done! Now, the size of binary is under 15K ( around 13.2K on glibc-based system ). And the shell is usable for simple tasks too.
