@@ -144,36 +144,47 @@ set_env :: proc(key, val: string) {
 	full_entry := join({key, "=", val}, "")
 	entry_len := len(full_entry)
 
+	// First: try to replace existing
 	cursor := 0
 	for cursor < env_len {
 		start := cursor
+		for end := start; end < env_len && env_buffer[end] != 0; end += 1 {
+			// find end
+		}
 		end := start
 		for end < env_len && env_buffer[end] != 0 {end += 1}
 
+		if env_buffer[start] == 0 {
+			cursor = end + 1
+			continue
+		}
+
 		entry := string(env_buffer[start:end])
+		cursor = end + 1
 
 		if len(entry) > len(key) && entry[len(key)] == '=' && entry[:len(key)] == key {
 			if entry_len <= len(entry) {
-				copy(raw_data(env_buffer[start:]), raw_data(full_entry), len(full_entry))
+				copy(raw_data(env_buffer[start:]), raw_data(full_entry), entry_len)
 				if entry_len < len(entry) {
-					for i in entry_len ..< len(entry) {env_buffer[start + i] = 0}
+					for i := entry_len; i < len(entry); i += 1 {
+						env_buffer[start + i] = 0
+					}
 				}
 				return
 			}
 			env_buffer[start] = 0
 			break
 		}
-		cursor = end + 1
 	}
 
-	if env_len + entry_len + 1 <= len(env_buffer) {
-		copy(raw_data(env_buffer[env_len:]), raw_data(full_entry), len(full_entry))
-		env_len += entry_len
-		env_buffer[env_len] = 0
-		env_len += 1
-	} else {
-		write(2, "Error: env_buffer is full\n")
+	if env_len + entry_len + 1 > len(env_buffer) {
+		write(2, "Error: env_buffer full\n")
+		return
 	}
+
+	copy(raw_data(env_buffer[env_len:]), raw_data(full_entry), entry_len)
+	env_buffer[env_len + entry_len] = 0
+	env_len += entry_len + 1
 }
 
 is_executable :: proc(path: cstring) -> bool {
@@ -207,6 +218,7 @@ read_line :: proc(buf: ^[]u8) -> (string, bool) {
 			if new_size == 0 do new_size = 4096
 			buf^ = slice_grow(buf^, new_size)
 		}
+
 		b: u8
 		n := read(0, &b, 1)
 
@@ -221,6 +233,10 @@ read_line :: proc(buf: ^[]u8) -> (string, bool) {
 
 		buf^[total_read] = b
 		total_read += 1
+	}
+
+	for i in total_read ..< len(buf^) {
+		buf^[i] = 0
 	}
 
 	return string(buf^[:total_read]), true
@@ -290,20 +306,15 @@ split :: proc(s: string, char: byte) -> []string {
 }
 
 trim_space :: proc(s: string) -> string {
-	if len(s) == 0 do return ""
-
 	start := 0
-	if start < len(s) && is_space(s[start]) {
+	end := len(s)
+
+	for start < end && is_space(s[start]) {
 		start += 1
 	}
-
-	if start == len(s) do return ""
-
-	end := len(s)
 	for end > start && is_space(s[end - 1]) {
 		end -= 1
 	}
-
 	return s[start:end]
 }
 
@@ -311,20 +322,17 @@ contains :: proc(s, substr: string) -> bool {
 	if len(substr) == 0 do return true
 	if len(substr) > len(s) do return false
 
-	if len(substr) == 1 {
-		target := substr[0]
-		for i in 0 ..< len(s) {
-			if s[i] == target do return true
+	last_start := len(s) - len(substr)
+	for i in 0 ..= last_start {
+		match := true
+		for j in 0 ..< len(substr) {
+			if s[i + j] != substr[j] {
+				match = false
+				break
+			}
 		}
-		return false
+		if match do return true
 	}
-
-	for i in 0 ..< len(s) - len(substr) + 1 {
-		if s[i:i + len(substr)] == substr {
-			return true
-		}
-	}
-
 	return false
 }
 
@@ -438,48 +446,81 @@ expand_env :: proc(args: []string) -> []string {
 		}
 
 		varName := arg[1:nameEnd]
-
 		val := get_env(varName)
-		args[i] = join([]string{val, arg[nameEnd:]}, "")
+
+		suffix := arg[nameEnd:]
+		total_len := len(val) + len(suffix)
+
+		mem := scratch_alloc(total_len)
+		copy(raw_data(mem), raw_data(val), len(val))
+		copy(raw_data(mem[len(val):]), raw_data(suffix), len(suffix))
+
+		args[i] = string(mem[:total_len])
 	}
 	return args
 }
 
 run_cmd :: proc(prog: string, args: []string, is_forked := false) {
+	// Find path first - must be stable across fork
+	path := find_path(prog)
+
+	// Parse args and redirections
 	argv: [128]cstring
-	argv[0] = find_path(prog)
+	argv[0] = path
 
 	arg_count := 1
 	out_file: string
+	in_file: string
 	append_mode := false
 
-	for i := 0; i < len(args); i += 1 {
+	i := 0
+	for i < len(args) && arg_count < 127 {
 		arg := args[i]
-		if arg == ">" || arg == ">>" {
+		if arg == ">" {
 			if i + 1 < len(args) {
 				out_file = args[i + 1]
-				append_mode = (arg == ">>")
-				break
+				append_mode = false
+				i += 2
+				continue
 			}
-		}
-
-		if arg_count < 127 {
+		} else if arg == ">>" {
+			if i + 1 < len(args) {
+				out_file = args[i + 1]
+				append_mode = true
+				i += 2
+				continue
+			}
+		} else if arg == "<" {
+			if i + 1 < len(args) {
+				in_file = args[i + 1]
+				i += 2
+				continue
+			}
+		} else {
 			argv[arg_count] = to_cstring(arg)
 			arg_count += 1
 		}
+		i += 1
 	}
 	argv[arg_count] = nil
 
-	execute_internal :: proc(path: cstring, argv: [^]cstring, out_file: string, append: bool) {
+	execute_internal :: proc(
+		path: cstring,
+		argv: [^]cstring,
+		out_file, in_file: string,
+		append: bool,
+	) {
+		if in_file != "" {
+			fd := open(-100, to_cstring(in_file), 0, 0)
+			if fd >= 0 {
+				dup2(fd, 0)
+				close(fd)
+			}
+		}
+
 		if out_file != "" {
-			O_WRONLY: i32 : 1
-			O_CREAT: i32 : 64
-			O_TRUNC: i32 : 512
-			O_APPEND: i32 : 1024
-
-			flags := O_WRONLY | O_CREAT
-			flags |= append ? O_APPEND : O_TRUNC
-
+			flags: i32 = 1 | 64
+			flags |= append ? 1024 : 512
 			fd := open(-100, to_cstring(out_file), flags, 0o644)
 			if fd >= 0 {
 				dup2(fd, 1)
@@ -487,16 +528,17 @@ run_cmd :: proc(prog: string, args: []string, is_forked := false) {
 			}
 		}
 		execveat(-100, path, argv, nil, 0)
+		write(2, "exec failed\n")
 		exit(127)
 	}
 
 	if is_forked {
-		execute_internal(argv[0], raw_data(argv[:]), out_file, append_mode)
+		execute_internal(argv[0], raw_data(argv[:]), out_file, in_file, append_mode)
 	} else {
 		pid := fork()
 		if pid == 0 {
-			execute_internal(argv[0], raw_data(argv[:]), out_file, append_mode)
-		} else {
+			execute_internal(argv[0], raw_data(argv[:]), out_file, in_file, append_mode)
+		} else if pid > 0 {
 			wait4(pid, nil, {}, nil)
 		}
 	}
@@ -509,6 +551,8 @@ exec :: proc(input: string) {
 	if contains(input, "|") {
 		commands := split(input, '|')
 		prev_read_end: i32 = 0
+		pids: [64]i32
+		pid_count := 0
 
 		for i in 0 ..< len(commands) {
 			cmd_str := trim_space(commands[i])
@@ -519,10 +563,18 @@ exec :: proc(input: string) {
 			next_pipe: [2]i32
 
 			if !is_last {
-				pipe(&next_pipe)
+				if pipe(&next_pipe) < 0 {
+					write(2, "pipe failed\n")
+					break
+				}
 			}
 
 			pid := fork()
+			if pid < 0 {
+				write(2, "fork failed\n")
+				break
+			}
+
 			if pid == 0 {
 				if prev_read_end != 0 {
 					dup2(prev_read_end, 0)
@@ -535,32 +587,40 @@ exec :: proc(input: string) {
 					close(next_pipe[1])
 				}
 
-				if args[0] == "cd" || args[0] == "exit" {
+				if len(args) > 0 && (args[0] == "cd" || args[0] == "exit") {
 					exit(0)
 				}
 
-				run_cmd(args[0], args[1:], true)
-				exit(0)
+				if len(args) > 0 {
+					run_cmd(args[0], args[1:], true)
+				}
+				exit(127)
 			} else {
-				if prev_read_end != 0 do close(i32(prev_read_end))
+				if prev_read_end != 0 {
+					close(prev_read_end)
+				}
 				if !is_last {
-					close(i32(next_pipe[1]))
+					close(next_pipe[1])
 					prev_read_end = next_pipe[0]
 				}
 
-				if is_last {
-					wait4(pid, nil, {}, nil)
-				}
+				pids[pid_count] = pid
+				pid_count += 1
 			}
+		}
+
+		for i in 0 ..< pid_count {
+			wait4(pids[i], nil, {}, nil)
 		}
 	} else {
 		args := fields(input)
+		if len(args) == 0 {return}
 		args = expand_env(args[:])
 		switch args[0] {
 		case "cd":
 			target: string
 			if len(args) == 1 do target = get_homedir()
-			else if len(args) == 2 do target = expand_tilde(args[1])
+			else if len(args) >= 2 do target = expand_tilde(args[1])
 			set_cwd(target)
 		case "exit":
 			exit(0)
@@ -584,7 +644,6 @@ print_prompt :: proc(username, hostname, cwd: string) {
 
 
 main :: proc() {
-	// Increase this to 64KB or more since all work happens here now
 	buffer = slice_alloc(65536)
 	line_buffer = slice_alloc(4096)
 	env_buffer = slice_alloc(4096)
