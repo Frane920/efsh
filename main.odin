@@ -1,13 +1,12 @@
 package main
 
-import "core:sys/linux"
-
 is_space :: #force_inline proc(c: u8) -> bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'
 }
 
 
 buffer := []u8{}
+buffer_ptr := 0
 line_buffer := []u8{}
 env_buffer := []u8{}
 env_len := 0
@@ -15,78 +14,103 @@ exit_code := 0
 
 foreign _ {
 	@(link_name = "asm_exit")
-	exit :: proc(code: int) -> ! ---
+	exit :: proc(code: i32) -> ! ---
 	@(link_name = "asm_write")
 	write :: proc(fd: i32, s: string) ---
 	@(link_name = "asm_read")
 	read :: proc(fd: i32, buffer_ptr: [^]u8, buffer_len: int) -> int ---
 	@(link_name = "asm_close")
-	close :: proc(fd: linux.Fd) -> linux.Errno ---
+	close :: proc(fd: i32) -> i32 ---
 	@(link_name = "asm_mmap")
-	asm_mmap :: proc(addr: rawptr, size: uint, prot: i32, flags: i32, fd: i32, offset: i64) -> rawptr ---
+	mmap :: proc(addr: rawptr, size: uint, prot: i32, flags: i32, fd: i32, offset: i64) -> rawptr ---
 	@(link_name = "asm_mremap")
-	asm_mremap :: proc(old_addr: rawptr, old_size: uint, new_size: uint, flags: i32) -> rawptr ---
+	mremap :: proc(old_addr: rawptr, old_size: uint, new_size: uint, flags: i32) -> rawptr ---
+	@(link_name = "asm_open")
+	open :: proc(dirfd: i32, path: cstring, flags: i32, mode: i32) -> i32 ---
+	@(link_name = "asm_pipe")
+	pipe :: proc(fds: ^[2]i32) -> i32 ---
+	@(link_name = "asm_dup2")
+	dup2 :: proc(old_fd, new_fd: i32) -> i32 ---
+	@(link_name = "asm_execveat")
+	execveat :: proc(dirfd: i32, pathname: cstring, argv: [^]cstring, envp: [^]cstring, flags: i32) -> i32 ---
+	@(link_name = "asm_getcwd")
+	getcwd :: proc(buf: [^]u8, size: int) -> int ---
+	@(link_name = "asm_fork")
+	fork :: proc() -> i32 ---
+	@(link_name = "asm_wait4")
+	wait4 :: proc(pid: i32, status: ^i32, options: i32, rusage: rawptr) -> i32 ---
+	@(link_name = "asm_chdir")
+	chdir :: proc(path: cstring) -> i32 ---
+	@(link_name = "asm_faccessat")
+	faccessat :: proc(dirfd: i32, pathname: cstring, mode: i32, flags: i32) -> i32 ---
 	@(link_name = "asm_to_cstring")
 	_to_cstring :: proc(dest: [^]u8, src: rawptr, len: int) -> cstring ---
 	@(link_name = "asm_join")
 	_join :: proc(dest: [^]u8, strings_ptr: [^]string, count: int, sep_ptr: [^]u8, sep_len: int) -> int ---
 }
 
-to_cstring :: proc(s: string, allocator := context.temp_allocator) -> cstring {
+copy :: proc(dst, src: rawptr, len: int) {
+	d := ([^]u8)(dst)
+	s := ([^]u8)(src)
+	for i in 0 ..< len {
+		d[i] = s[i]
+	}
+}
+
+to_cstring :: proc(s: string) -> cstring {
 	if len(s) == 0 do return ""
-	mem := make([]u8, len(s) + 1, allocator)
+	mem := scratch_alloc(len(s) + 1)
 	return _to_cstring(raw_data(mem), raw_data(s), len(s))
 }
 
-join :: proc(a: []string, sep: string, allocator := context.temp_allocator) -> string {
+join :: proc(a: []string, sep: string) -> string {
 	if len(a) == 0 do return ""
 	if len(a) == 1 do return a[0]
-
 	total_len := len(sep) * (len(a) - 1)
 	for s in a do total_len += len(s)
 
-	mem := make([]u8, total_len, allocator)
-
+	mem := scratch_alloc(total_len)
 	_join(raw_data(mem), raw_data(a), len(a), raw_data(sep), len(sep))
-
 	return string(mem)
 }
 
 slice_alloc :: proc(size: int) -> []u8 {
-	addr := asm_mmap(nil, uint(size), 0x1 | 0x2, 0x02 | 0x20, -1, 0)
+	addr := mmap(nil, uint(size), 0x1 | 0x2, 0x02 | 0x20, -1, 0)
 
 	if uintptr(addr) >= ~uintptr(4095) {
 		write(2, "mmap failed\n")
 		exit(1)
 	}
 
-	return transmute([]u8)Raw_Slice{data = addr, len = size}
+	return ([^]u8)(addr)[:size]
 }
 
 slice_grow :: proc(old_slice: []u8, new_size: int) -> []u8 {
-	new_addr := asm_mremap(raw_data(old_slice), uint(len(old_slice)), uint(new_size), 1)
+	new_addr := mremap(raw_data(old_slice), uint(len(old_slice)), uint(new_size), 1)
 
 	if uintptr(new_addr) >= ~uintptr(4095) {
 		write(2, "mremap failed\n")
 		exit(1)
 	}
-
-	return transmute([]u8)Raw_Slice{data = new_addr, len = new_size}
+	return ([^]u8)(new_addr)[:new_size]
 }
 
-Raw_Slice :: struct {
-	data: rawptr,
-	len:  int,
+scratch_alloc :: proc(size: int) -> []u8 {
+	if buffer_ptr + size > len(buffer) {
+		write(2, "Error: global buffer exhausted\n")
+		exit(1)
+	}
+	res := buffer[buffer_ptr:buffer_ptr + size]
+	buffer_ptr += size
+	return res
 }
 
 init_env :: proc() {
-	path := "/proc/self/environ"
-	path_cstr := to_cstring(path)
+	path_cstr := to_cstring("/proc/self/environ")
+	fd := open(-100, path_cstr, 0, 0)
+	if fd < 0 do return
 
-	fd, errno := linux.open(path_cstr, {.RDWR}, {})
-	if errno != .NONE {return}
-
-	n, _ := linux.read(fd, env_buffer[:])
+	n := read(fd, raw_data(env_buffer), len(env_buffer))
 	env_len = n
 	close(fd)
 }
@@ -117,7 +141,7 @@ get_env :: proc(key: string) -> string {
 }
 
 set_env :: proc(key, val: string) {
-	full_entry := join({key, "=", val}, "", context.temp_allocator)
+	full_entry := join({key, "=", val}, "")
 	entry_len := len(full_entry)
 
 	cursor := 0
@@ -130,7 +154,7 @@ set_env :: proc(key, val: string) {
 
 		if len(entry) > len(key) && entry[len(key)] == '=' && entry[:len(key)] == key {
 			if entry_len <= len(entry) {
-				copy(env_buffer[start:], full_entry)
+				copy(raw_data(env_buffer[start:]), raw_data(full_entry), len(full_entry))
 				if entry_len < len(entry) {
 					for i in entry_len ..< len(entry) {env_buffer[start + i] = 0}
 				}
@@ -143,7 +167,7 @@ set_env :: proc(key, val: string) {
 	}
 
 	if env_len + entry_len + 1 <= len(env_buffer) {
-		copy(env_buffer[env_len:], full_entry)
+		copy(raw_data(env_buffer[env_len:]), raw_data(full_entry), len(full_entry))
 		env_len += entry_len
 		env_buffer[env_len] = 0
 		env_len += 1
@@ -152,44 +176,26 @@ set_env :: proc(key, val: string) {
 	}
 }
 
-find_path :: proc(cmd: string, allocator := context.temp_allocator) -> cstring {
+is_executable :: proc(path: cstring) -> bool {
+	return faccessat(-100, path, 1, 0) == 0
+}
+
+find_path :: proc(cmd: string) -> cstring {
 	if contains(cmd, "/") {
 		return to_cstring(cmd)
 	}
-
 	path_env := get_env("PATH")
 	if path_env == "" do path_env = "/usr/bin:/bin"
-
-	directories := split(path_env, ':', allocator)
+	directories := split(path_env, ':')
 	for dir in directories {
 		if len(dir) == 0 do continue
-		full_path := join({dir, "/", cmd}, "", allocator)
-
+		full_path := join({dir, "/", cmd}, "")
 		c_path := to_cstring(full_path)
-		stat: linux.Stat
-		if linux.stat(c_path, &stat) == .NONE {
+		if is_executable(c_path) {
 			return c_path
 		}
 	}
 	return to_cstring(cmd)
-}
-
-execve :: proc(prog: string, argv: []cstring) {
-	if contains(prog, "/") {
-		p_cstr := to_cstring(prog)
-		linux.execve(p_cstr, raw_data(argv), nil)
-		return
-	}
-
-	path_env := get_env("PATH")
-	paths := split(path_env, ':', context.temp_allocator)
-
-	for p in paths {
-		full_path := join({p, "/", prog}, "", context.temp_allocator)
-		c_path := to_cstring(full_path)
-
-		linux.execve(c_path, raw_data(argv), nil)
-	}
 }
 
 read_line :: proc(buf: ^[]u8) -> (string, bool) {
@@ -220,39 +226,46 @@ read_line :: proc(buf: ^[]u8) -> (string, bool) {
 	return string(buf^[:total_read]), true
 }
 
-itoa :: proc(n: int, allocator := context.temp_allocator) -> string {
-	if n == 0 do return "0"
-
-	buf: [21]byte
-	i := len(buf)
+itoa :: proc(n: int) -> string {
+	if n == 0 {
+		mem := scratch_alloc(1)
+		mem[0] = '0'
+		return string(mem)
+	}
 
 	val := n
 	is_negative := false
-
 	if val < 0 {
 		is_negative = true
 		val = -val
 	}
 
-	for val > 0 {
-		i -= 1
-		buf[i] = byte(val % 10) + '0'
-		val /= 10
+	length := 0
+	temp := val
+	for temp > 0 {
+		temp /= 10
+		length += 1
+	}
+	if is_negative do length += 1
+
+	mem := scratch_alloc(length)
+
+	curr := length - 1
+	temp_val := val
+	for temp_val > 0 {
+		mem[curr] = u8(temp_val % 10) + '0'
+		temp_val /= 10
+		curr -= 1
 	}
 
 	if is_negative {
-		i -= 1
-		buf[i] = '-'
+		mem[0] = '-'
 	}
 
-	res_bytes := buf[i:]
-	s := make([]byte, len(res_bytes), allocator)
-	copy(s, res_bytes)
-
-	return string(s)
+	return string(mem)
 }
 
-split :: proc(s: string, char: byte, allocator := context.temp_allocator) -> []string {
+split :: proc(s: string, char: byte) -> []string {
 	if len(s) == 0 do return nil
 
 	n := 1
@@ -260,7 +273,8 @@ split :: proc(s: string, char: byte, allocator := context.temp_allocator) -> []s
 		if s[i] == char do n += 1
 	}
 
-	res := make([]string, n, allocator)
+	mem := scratch_alloc(n * size_of(string))
+	res := ([^]string)(raw_data(mem))[:n]
 
 	curr_n := 0
 	start := 0
@@ -314,63 +328,52 @@ contains :: proc(s, substr: string) -> bool {
 	return false
 }
 
-fields :: proc(s: string, allocator := context.temp_allocator) -> []string {
+fields :: proc(s: string) -> []string {
 	if len(s) == 0 do return nil
-
 	n := 0
 	in_field := false
 	for i in 0 ..< len(s) {
-		is_space := is_space(s[i]) == true
-		if !is_space && !in_field {
-			in_field = true
-			n += 1
-		} else if is_space {
+		is_sp := is_space(s[i])
+		if !is_sp && !in_field {
+			in_field = true; n += 1
+		} else if is_sp {
 			in_field = false
 		}
 	}
-
 	if n == 0 do return nil
 
-	res := make([]string, n, allocator)
+	mem := scratch_alloc(n * size_of(string))
+	res := ([^]string)(raw_data(mem))[:n]
+
 	na := 0
 	field_start := -1
-
 	for i in 0 ..< len(s) {
-		is_space := is_space(s[i]) == true
-		if !is_space {
+		if !is_space(s[i]) {
 			if field_start == -1 do field_start = i
-		} else {
-			if field_start != -1 {
-				res[na] = s[field_start:i]
-				na += 1
-				field_start = -1
-			}
+		} else if field_start != -1 {
+			res[na] = s[field_start:i]
+			na += 1; field_start = -1
 		}
 	}
-
-	if field_start != -1 {
-		res[na] = s[field_start:]
-	}
-
+	if field_start != -1 do res[na] = s[field_start:]
 	return res
 }
 
-concatenate :: proc(a: []string, allocator := context.temp_allocator) -> string {
+concatenate :: proc(a: []string) -> string {
 	if len(a) == 0 do return ""
 
 	total_len := 0
 	for s in a do total_len += len(s)
 
-	b := make([]byte, total_len, allocator)
+	mem := scratch_alloc(total_len)
 
 	offset := 0
 	for s in a {
-		copy(b[offset:], s)
+		copy(raw_data(mem[offset:]), raw_data(s), len(s))
 		offset += len(s)
 	}
-	return string(b)
+	return string(mem)
 }
-
 
 has_prefix :: proc(s, prefix: string) -> (result: bool) {
 	return len(s) >= len(prefix) && s[0:len(prefix)] == prefix
@@ -385,18 +388,15 @@ get_homedir :: proc() -> string {
 }
 
 get_cwd :: proc() -> string {
-	n, errno := linux.getcwd(buffer[:])
-	if errno != .NONE || n <= 0 {
-		return ""
-	}
+	n := getcwd(raw_data(buffer[:]), len(buffer))
 	return string(buffer[:n])
 }
 
 set_cwd :: proc(path: string) -> bool {
 	cpath := to_cstring(path)
 
-	errno := linux.chdir(cpath)
-	return errno == .NONE
+	errno := chdir(cpath)
+	return errno == 0
 }
 
 
@@ -408,7 +408,7 @@ shorten_home :: proc(path: string) -> string {
 	}
 
 	if has_prefix(path, home) {
-		return concatenate({"~", path[len(home):]}, context.temp_allocator)
+		return concatenate({"~", path[len(home):]})
 	}
 
 	return path
@@ -420,7 +420,7 @@ expand_tilde :: proc(input: string) -> string {
 		return home
 	}
 	if has_prefix(input, "~/") {
-		return concatenate({home, input[1:]}, context.temp_allocator)
+		return concatenate({home, input[1:]})
 	}
 	return input
 }
@@ -472,28 +472,32 @@ run_cmd :: proc(prog: string, args: []string, is_forked := false) {
 
 	execute_internal :: proc(path: cstring, argv: [^]cstring, out_file: string, append: bool) {
 		if out_file != "" {
-			flags: linux.Open_Flags = {.WRONLY, .CREAT}
-			if append do flags += {.APPEND}
-			else do flags += {.TRUNC}
+			O_WRONLY: i32 : 1
+			O_CREAT: i32 : 64
+			O_TRUNC: i32 : 512
+			O_APPEND: i32 : 1024
 
-			fd, errno := linux.open(to_cstring(out_file), flags, {.IRUSR, .IWUSR, .IRGRP, .IROTH})
-			if errno == .NONE {
-				linux.dup2(fd, 1)
+			flags := O_WRONLY | O_CREAT
+			flags |= append ? O_APPEND : O_TRUNC
+
+			fd := open(-100, to_cstring(out_file), flags, 0o644)
+			if fd >= 0 {
+				dup2(fd, 1)
 				close(fd)
 			}
 		}
-		linux.execve(path, argv, nil)
+		execveat(-100, path, argv, nil, 0)
 		exit(127)
 	}
 
 	if is_forked {
 		execute_internal(argv[0], raw_data(argv[:]), out_file, append_mode)
 	} else {
-		pid, _ := linux.fork()
+		pid := fork()
 		if pid == 0 {
 			execute_internal(argv[0], raw_data(argv[:]), out_file, append_mode)
 		} else {
-			linux.waitpid(pid, nil, {}, nil)
+			wait4(pid, nil, {}, nil)
 		}
 	}
 }
@@ -503,31 +507,31 @@ exec :: proc(input: string) {
 	if len(input) == 0 {return}
 
 	if contains(input, "|") {
-		commands := split(input, '|', context.temp_allocator)
-		prev_read_end: linux.Fd = 0
+		commands := split(input, '|')
+		prev_read_end: i32 = 0
 
 		for i in 0 ..< len(commands) {
 			cmd_str := trim_space(commands[i])
-			args := fields(cmd_str, context.temp_allocator)
+			args := fields(cmd_str)
 			args = expand_env(args[:])
 
 			is_last := i == len(commands) - 1
-			next_pipe: [2]linux.Fd
+			next_pipe: [2]i32
 
 			if !is_last {
-				linux.pipe2(&next_pipe, {.CLOEXEC})
+				pipe(&next_pipe)
 			}
 
-			pid, _ := linux.fork()
+			pid := fork()
 			if pid == 0 {
 				if prev_read_end != 0 {
-					linux.dup2(prev_read_end, 0)
+					dup2(prev_read_end, 0)
 					close(prev_read_end)
 				}
 
 				if !is_last {
-					linux.dup2(next_pipe[1], 1)
 					close(next_pipe[0])
+					dup2(next_pipe[1], 1)
 					close(next_pipe[1])
 				}
 
@@ -538,19 +542,19 @@ exec :: proc(input: string) {
 				run_cmd(args[0], args[1:], true)
 				exit(0)
 			} else {
-				if prev_read_end != 0 do close(prev_read_end)
+				if prev_read_end != 0 do close(i32(prev_read_end))
 				if !is_last {
-					close(next_pipe[1])
+					close(i32(next_pipe[1]))
 					prev_read_end = next_pipe[0]
 				}
 
 				if is_last {
-					linux.waitpid(pid, nil, {}, nil)
+					wait4(pid, nil, {}, nil)
 				}
 			}
 		}
 	} else {
-		args := fields(input, context.temp_allocator)
+		args := fields(input)
 		args = expand_env(args[:])
 		switch args[0] {
 		case "cd":
@@ -580,28 +584,24 @@ print_prompt :: proc(username, hostname, cwd: string) {
 
 
 main :: proc() {
-	buffer = slice_alloc(4096)
+	// Increase this to 64KB or more since all work happens here now
+	buffer = slice_alloc(65536)
 	line_buffer = slice_alloc(4096)
 	env_buffer = slice_alloc(4096)
 
 	init_env()
-
-	username := get_env("USER")
-	hostname := get_env("HOSTNAME")
-
 	for {
+		buffer_ptr = 0
+
+		username := get_env("USER")
+		hostname := get_env("HOSTNAME")
 		print_prompt(username, hostname, get_cwd())
 
 		line, ok := read_line(&line_buffer)
-
-		if !ok {
-			exit(0)
-		}
+		if !ok do exit(0)
 
 		if len(line) > 0 {
 			exec(line)
 		}
-
-		free_all(context.temp_allocator)
 	}
 }
